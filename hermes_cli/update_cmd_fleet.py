@@ -83,6 +83,37 @@ def _current_checkout_sha() -> str | None:
         return _capture_head_sha(["git"], _m().PROJECT_ROOT)
 
 
+def _sha_is_ancestor(expected_sha: str, code_sha: str) -> bool:
+    """True only when *code_sha* provably descends from *expected_sha* in this checkout.
+
+    A fleet running code NEWER than what a receipt restarted it onto has discharged that
+    obligation: the restart happened, and the checkout moved on afterwards. Requiring
+    equality instead makes the warning permanent for anyone who advances the checkout by
+    any means other than ``hermes update`` — which is exactly how this fork is maintained.
+    Unknown or unreachable objects stay fail-closed; never claim coverage we cannot prove.
+
+    Carried patch: upstream PR NousResearch/hermes-agent#116431. Drop on the merge that
+    brings it in.
+    """
+    if not expected_sha or not code_sha:
+        return False
+    from hermes_cli.update_cmd import _git_run, _m
+    try:
+        result = _git_run(
+            ["git"], ["merge-base", "--is-ancestor", expected_sha, code_sha], _m().PROJECT_ROOT)
+    except Exception as exc:
+        logger.debug("Could not compare %s with %s: %s", expected_sha, code_sha, exc)
+        return False
+    return result.returncode == 0
+
+
+def _row_covers_sha(row: dict, expected_sha: str) -> bool:
+    code_sha = row.get("code_sha")
+    if not isinstance(code_sha, str) or not code_sha:
+        return False
+    return code_sha == expected_sha or _sha_is_ancestor(expected_sha, code_sha)
+
+
 def _receipt_looks_unfinished(receipt: dict) -> bool:
     """True when *receipt* is from an update that did not finish cleanly.
 
@@ -192,7 +223,7 @@ def _live_fleet_covers_receipt(expected_sha: str | None, *, accept_states: tuple
         # ``stale`` too: the row's stamped ``code_sha`` is the identity that matters there.
         # ``unknown``/``down`` rows never cover.
         if not fleet or any(
-            row.get("state") not in accept_states or row.get("code_sha") != expected_sha
+            row.get("state") not in accept_states or not _row_covers_sha(row, expected_sha)
             for row in fleet
         ):
             return False

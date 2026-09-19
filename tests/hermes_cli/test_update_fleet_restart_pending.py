@@ -803,3 +803,55 @@ def test_startup_warn_silent_when_failed_receipt_already_restarted_fleet(monkeyp
 
     assert capsys.readouterr().err == ""
     assert update_cmd_fleet._pending_fleet_restart_needed() is True
+
+
+def _fleet_row(code_sha: str, state: str = "current") -> dict:
+    return {"profile": "default", "pid": 4444, "code_sha": code_sha,
+            "code_version": "0.21.3", "state": state}
+
+
+def _covers(monkeypatch, expected_sha: str, row_sha: str, *, ancestor: bool) -> bool:
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **_k: [_fleet_row(row_sha)],
+    )
+    monkeypatch.setattr(update_cmd_fleet, "_receipt_owed_gateways",
+                        lambda: {("gateway", "default")})
+    monkeypatch.setattr(
+        update_cmd_fleet, "_sha_is_ancestor",
+        lambda expected, code: ancestor and (expected, code) == (expected_sha, row_sha),
+    )
+    return update_cmd_fleet._live_fleet_covers_receipt(expected_sha)
+
+
+def test_fleet_at_the_expected_sha_still_covers(monkeypatch):
+    assert _covers(monkeypatch, "aaa111", "aaa111", ancestor=False)
+
+
+def test_fleet_running_a_descendant_covers_the_obligation(monkeypatch):
+    """A gateway on code NEWER than the receipt's SHA has discharged the restart: this fork
+    advances its checkout by merging upstream, not by running `hermes update`."""
+    assert _covers(monkeypatch, "aaa111", "bbb222", ancestor=True)
+
+
+def test_an_unrelated_sha_does_not_cover(monkeypatch):
+    assert not _covers(monkeypatch, "aaa111", "ccc333", ancestor=False)
+
+
+def test_sha_is_ancestor_reports_git_verdict(monkeypatch):
+    calls = {}
+
+    def _git_run(_git_cmd, args, _cwd):
+        calls["args"] = args
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("hermes_cli.update_cmd._git_run", _git_run)
+    assert update_cmd_fleet._sha_is_ancestor("aaa111", "bbb222")
+    assert calls["args"] == ["merge-base", "--is-ancestor", "aaa111", "bbb222"]
+
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._git_run",
+        lambda _g, _a, _c: SimpleNamespace(returncode=1),
+    )
+    assert not update_cmd_fleet._sha_is_ancestor("aaa111", "ccc333")
+    assert not update_cmd_fleet._sha_is_ancestor("", "bbb222")
