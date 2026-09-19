@@ -1153,6 +1153,19 @@ DEFAULT_CONFIG = {
         # see them. Off by default: a gateway may own several jobs and every one of them would
         # start talking the moment the bot joins a VC.
         "auto_tts_cron": False,
+        # Spoken finals are rewritten into a script before TTS: written prose (bullets,
+        # paths, parentheticals) reads badly aloud. `system_prompt: ""` keeps the built-in
+        # French one; `skip_under_chars` lets a short plain ack through untouched, which
+        # saves an auxiliary model call and stops the rewrite from padding it.
+        "oral_rewrite": {
+            "enabled": True,
+            "skip_under_chars": 120,
+            "max_chars": 500,
+            "max_tokens": 400,
+            "temperature": 0.3,
+            "input_chars": 6000,
+            "system_prompt": "",
+        },
         # Desktop remote clients call STT/TTS providers DIRECTLY (config + key fetched over
         # authenticated REST at session start) instead of relaying via the gateway.
         "client_direct": True,

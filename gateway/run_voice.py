@@ -29,6 +29,8 @@ logger = logging.getLogger("gateway.run")  # log-record parity with the origin m
 _OFF_SET, _ON_SET = "_auto_tts_disabled_chats", "_auto_tts_enabled_chats"
 _VOICE_MODES = {"off", "voice_only", "all"}
 
+#: Fallback script prompt. Override per install with ``voice.oral_rewrite.system_prompt``;
+#: the default is written for a French-speaking assistant in a Discord voice channel.
 _ORAL_SYS = (
     "Tu réécris un message d'agent pour le dire à voix haute en français, "
     "dans un vocal Discord. Au plus 5 phrases courtes. Un fil, pas de liste, "
@@ -39,6 +41,36 @@ _ORAL_SYS = (
     "n'ajoute ni contexte, ni précision, ni politesse. "
     "Sortie = uniquement le script parlé, rien d'autre."
 )
+
+_ORAL_DEFAULTS = {
+    "enabled": True,
+    "skip_under_chars": 120,
+    "max_chars": 500,
+    "max_tokens": 400,
+    "temperature": 0.3,
+    "input_chars": 6000,
+    "system_prompt": "",
+}
+
+
+def _oral_settings() -> dict:
+    """``voice.oral_rewrite`` merged over the defaults. Never raises: voice is best-effort."""
+    merged = dict(_ORAL_DEFAULTS)
+    try:
+        from hermes_cli.config import load_config
+        configured = (load_config().get("voice") or {}).get("oral_rewrite")
+        if isinstance(configured, dict):
+            merged.update({k: v for k, v in configured.items() if v is not None})
+    except Exception:
+        pass
+    return merged
+
+
+def _reads_well_aloud(text: str, limit: int) -> bool:
+    """A short plain ack already reads well: rewriting it costs a call and risks padding."""
+    if limit <= 0 or len(text) > limit:
+        return False
+    return not any(token in text for token in ("http://", "https://", "/", "`", "|"))
 
 
 def _aux_reply_text(response) -> str:
@@ -82,23 +114,31 @@ def _drop_dangling_sentence(text: str) -> str:
 
 
 def oralize_for_discord_vc(text: str) -> str:
-    """Rewrite a written agent final into a short spoken FR script. Fallback = stripped prose."""
+    """Rewrite a written agent final into a short spoken script. Fallback = stripped prose."""
     from tools.tts_text_normalize import _strip_markdown_for_tts
     stripped = (_strip_markdown_for_tts(text) or "").strip()
     if not stripped:
         return ""
-    # Every spoken final goes through the rewrite: a short written answer is still written
-    # prose (bullets, paths, "cf.", parentheticals) and reads badly aloud.
+    settings = _oral_settings()
+    limit = int(settings["max_chars"])
+    if not settings["enabled"]:
+        return _truncate_spoken(stripped, limit)
+    # A short plain acknowledgement is already speech: rewriting it buys nothing and lets
+    # the model pad it. Anything longer, or carrying a path/URL/table, goes through.
+    if _reads_well_aloud(stripped, int(settings["skip_under_chars"])):
+        return stripped
     try:
         from agent.auxiliary_client import call_llm
         response = call_llm(
-            task="discord_vc_oral", temperature=0.3, max_tokens=400,
-            messages=[{"role": "system", "content": _ORAL_SYS},
-                      {"role": "user", "content": stripped[:6000]}],
+            task="discord_vc_oral",
+            temperature=float(settings["temperature"]),
+            max_tokens=int(settings["max_tokens"]),
+            messages=[{"role": "system", "content": str(settings["system_prompt"]) or _ORAL_SYS},
+                      {"role": "user", "content": stripped[: int(settings["input_chars"])]}],
         )
         spoken = _aux_reply_text(response)
         if spoken:
-            # max_tokens is a runaway guard, not a shaping tool (the shaping is _ORAL_SYS).
+            # max_tokens is a runaway guard, not a shaping tool (the shaping is the prompt).
             # When the CAP is what stopped the model, the tail is a dangling fragment and TTS
             # would read it out mid-word. The failure path below already trims on a sentence
             # boundary; the success path must not be sloppier than it.
@@ -110,7 +150,7 @@ def oralize_for_discord_vc(text: str) -> str:
             return spoken
     except Exception as exc:
         logger.warning("Discord VC oral rewrite failed; using stripped prose: %s", exc)
-    return _truncate_spoken(stripped)
+    return _truncate_spoken(stripped, limit)
 
 
 async def play_autonomous_voice(adapter, text: str) -> bool:

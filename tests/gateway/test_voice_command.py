@@ -365,7 +365,7 @@ class TestSendVoiceReply:
         adapter._should_auto_tts_for_chat = MagicMock(return_value=False)
         adapter.connected_voice_guild_id = MagicMock(return_value=111)
         runner.adapters[Platform.DISCORD] = adapter
-        source = _SS(chat_id="1548736999433834516", user_id="user1", platform=Platform.DISCORD)
+        source = _SS(chat_id="555000111222333444", user_id="user1", platform=Platform.DISCORD)
         event = MessageEvent(text="tick", message_type=MessageType.TEXT, source=source)
         assert runner._should_send_voice_reply(event, "Cron done.", []) is True
 
@@ -398,7 +398,7 @@ def test_oralize_rewrites_long_markdown(monkeypatch):
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Cron ok. Deux tickets ouverts."))])
 
     monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_llm)
-    long = "## Recap\n" + ("- item path /home/mickael/foo\n" * 40)
+    long = "## Recap\n" + ("- item path /tmp/example/foo\n" * 40)
     assert run_voice.oralize_for_discord_vc(long) == "Cron ok. Deux tickets ouverts."
 
 
