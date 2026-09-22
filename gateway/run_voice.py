@@ -626,7 +626,7 @@ class GatewayVoiceMixin:
         try:
             from tools.tts_text_normalize import _strip_markdown_for_tts
             from tools.tts_tool import text_to_speech_tool
-            adapter = self._adapter_for_source(event.source)
+            adapter = self._delivery_adapter_for(event.source)
             in_vc = False
             if event.source.platform == Platform.DISCORD:
                 getter = getattr(adapter, "connected_voice_guild_id", None)
