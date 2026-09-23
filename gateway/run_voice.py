@@ -161,7 +161,9 @@ async def play_autonomous_voice(adapter, text: str) -> bool:
     so every lane that delivers WITHOUT a turn — cron jobs, proactive heartbeats — can never reach
     it. This is the event-free equivalent: VC only (never a voice bubble in text, same rule as
     ``play_tts``), a no-op when the bot is not in a channel, and best-effort by construction — the
-    caller has ALREADY delivered the text, so a TTS failure must never fail that delivery.
+    caller has ALREADY delivered the text, so a TTS failure must never fail that delivery. A final
+    already spoken under the same settings replays its kept audio (``gateway.voice_reuse``) instead
+    of paying for the rewrite and the synthesis again.
     """
     if not (text or "").strip():
         return False
@@ -176,30 +178,41 @@ async def play_autonomous_voice(adapter, text: str) -> bool:
         return False  # not in a VC: stay silent, the text lane already spoke
     audio_path, actual_paths = None, []
     try:
+        from gateway import voice_reuse
         from tools.tts_tool import text_to_speech_tool
-        # Same rewrite as the turn path: an autonomous final is written prose (lists, paths,
-        # counts) and reads badly aloud verbatim.
-        spoken = await asyncio.to_thread(oralize_for_discord_vc, text)
-        if not spoken:
-            return False
-        audio_path = build_auto_tts_output_path(getattr(adapter, "platform", None))
-        raw = await asyncio.to_thread(text_to_speech_tool, text=spoken, output_path=audio_path)
-        try:
-            result = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Autonomous voice TTS returned invalid JSON: %s",
-                           raw[:200] if raw else raw)
-            return False
-        candidates = result.get("file_paths") or [result.get("file_path", audio_path)]
-        actual_paths = [str(p) for p in candidates if p and os.path.isfile(p)]
-        if not result.get("success") or not actual_paths:
-            logger.warning("Autonomous voice TTS failed: %s", result.get("error"))
-            return False
+        platform = getattr(adapter, "platform", None)
+        # Config load + manifest read: off the loop that also carries the voice connection.
+        reuse_key = await asyncio.to_thread(voice_reuse.key_for, text, platform)
+        play_paths = await asyncio.to_thread(voice_reuse.recall, reuse_key)
+        if play_paths is None:
+            # Same rewrite as the turn path: an autonomous final is written prose (lists, paths,
+            # counts) and reads badly aloud verbatim.
+            spoken = await asyncio.to_thread(oralize_for_discord_vc, text)
+            if not spoken:
+                return False
+            audio_path = build_auto_tts_output_path(platform)
+            raw = await asyncio.to_thread(text_to_speech_tool, text=spoken, output_path=audio_path)
+            try:
+                result = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Autonomous voice TTS returned invalid JSON: %s",
+                               raw[:200] if raw else raw)
+                return False
+            candidates = result.get("file_paths") or [result.get("file_path", audio_path)]
+            actual_paths = [str(p) for p in candidates if p and os.path.isfile(p)]
+            if not result.get("success") or not actual_paths:
+                logger.warning("Autonomous voice TTS failed: %s", result.get("error"))
+                return False
+            # Kept files move out of the temp dir; the finally below only deletes what stayed.
+            play_paths = await asyncio.to_thread(voice_reuse.keep, reuse_key, actual_paths)
+            replayed = False
+        else:
+            replayed = True
         # play_in_voice_channel is silent on success and this lane's failure mode IS silence:
         # without a log the operator cannot tell "spoke" from "never fired".
-        logger.info("[Discord] Playing autonomous TTS in voice channel (guild=%s, files=%d)",
-                    guild_id, len(actual_paths))
-        for path in actual_paths:
+        logger.info("[Discord] Playing autonomous TTS in voice channel (guild=%s, files=%d%s)",
+                    guild_id, len(play_paths), ", replayed" if replayed else "")
+        for path in play_paths:
             await play(guild_id, path)
         return True
     except Exception as exc:

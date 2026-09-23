@@ -1315,6 +1315,23 @@ Hermes's own `~/.hermes/state.db` is an internal schema that changes between rel
 
 Credit: this recipe set was prompted by @iankar8's exploration in [#2654](https://github.com/NousResearch/hermes-agent/pull/2654), which proposed adding sql/file/command triggers as a parallel mechanism. The `script` + `wakeAgent` gate already covers all three cases at $0, so the work landed as documentation instead.
 
+### Replaying a final: `reuseKey`
+
+A script that wakes the agent can also say that this tick asks for a message the agent has already written. Put a `reuseKey` on the same last-line JSON object as `wakeAgent`:
+
+```text
+{"wakeAgent": true, "data": {"minutes": 37, "priorities": ["Metalyde", "Ether"]}, "reuseKey": "sha256:…"}
+```
+
+The key is the script's claim that every tick printing it gets the same message — typically a digest of only the facts the message states, so counters and timestamps that move every tick do not change it. The first tick with a key runs the agent as usual and keeps its final; a later tick with the same key replays that final **without running the agent**, and delivery (text, then autonomous voice) proceeds as for a fresh one. The run document is titled `(reused final from <time>)`.
+
+- The key is scoped to the job's prompt, skills, and model pin: editing any of them writes a new final.
+- A final is kept for `cron.response_reuse_hours` (default `24`; `0` always runs the agent), 32 keys per job, in the job's output directory.
+- Nothing is kept for a `[SILENT]`, empty, `[CRON_FAILURE]`, or `MEDIA:`-carrying final, and a manual run with extra context or a monitor diff neither replays nor keeps one: the key never saw that input.
+- Do not combine it with `context_from: self` continuity — "don't repeat the last run" and "repeat the last run" cannot both hold.
+
+Spoken copies follow the same idea without a key: with `voice.auto_tts_cron`, the audio synthesized for a final is kept and replayed when the same text is spoken again under the same `tts` / `voice.oral_rewrite` settings, for `voice.reuse_hours` (default `24`; `0` disables).
+
 ### Chaining jobs: `context_from`
 
 A cron job can consume the most recent successful output of one or more other jobs by listing their names (or IDs) in `context_from`:

@@ -17,6 +17,18 @@ from typing import Optional
 logger = logging.getLogger("cron.scheduler")
 
 
+def _gate_object(script_output: str) -> Optional[dict]:
+    """The JSON object on the last non-empty stdout line — the script's gate — or None."""
+    stripped_lines = [line for line in (script_output or "").splitlines() if line.strip()]
+    if not stripped_lines:
+        return None
+    try:
+        gate = json.loads(stripped_lines[-1].strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return gate if isinstance(gate, dict) else None
+
+
 def _parse_wake_gate(script_output: str) -> bool:
     """Wake gate: False only if the last non-empty stdout line is JSON ``{"wakeAgent": false}``
     (agent skipped entirely — no LLM run, no delivery); anything else wakes normally.
@@ -24,14 +36,22 @@ def _parse_wake_gate(script_output: str) -> bool:
     Any other output (non-JSON, missing flag, gate absent, or ``wakeAgent: true``) means wake the agent
     normally. See #1232.
     """
-    stripped_lines = [line for line in (script_output or "").splitlines() if line.strip()]
-    if not stripped_lines:
-        return True
-    try:
-        gate = json.loads(stripped_lines[-1].strip())
-    except (json.JSONDecodeError, ValueError):
-        return True
-    return not isinstance(gate, dict) or gate.get("wakeAgent", True) is not False
+    gate = _gate_object(script_output)
+    return gate is None or gate.get("wakeAgent", True) is not False
+
+
+_MAX_REUSE_KEY_CHARS = 256
+
+
+def _parse_reuse_key(script_output: str) -> Optional[str]:
+    """``reuseKey`` from the gate line: the script's claim that any tick printing the same key
+    gets the same message, so the final already written for it may be replayed. Absent, blank,
+    non-string, or oversized → None (the agent runs as usual)."""
+    gate = _gate_object(script_output)
+    key = gate.get("reuseKey") if gate is not None else None
+    if not isinstance(key, str) or not key.strip() or len(key) > _MAX_REUSE_KEY_CHARS:
+        return None
+    return key
 
 
 def _prepend_context_block(prompt: str, heading: str, intro: str, body: str) -> str:

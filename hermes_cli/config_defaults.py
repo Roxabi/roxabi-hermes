@@ -1217,6 +1217,10 @@ DEFAULT_CONFIG = {
             "input_chars": 6000,
             "system_prompt": "",
         },
+        # Autonomous VC speech (voice.auto_tts_cron) replays the audio already synthesized for the
+        # same final text, under the same tts / oral_rewrite settings, for this many hours instead
+        # of rewriting and synthesizing it again. 0 = always synthesize.
+        "reuse_hours": 24,
         # Desktop remote clients call STT/TTS providers DIRECTLY (config + key fetched over
         # authenticated REST at session start) instead of relaying via the gateway.
         "client_direct": True,
@@ -1849,6 +1853,12 @@ DEFAULT_CONFIG = {
         # silences a signature for good. 0 = re-alert on every failing run. Keep in sync with
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
+        # A pre-run script that prints `reuseKey` on its gate line (beside `wakeAgent`) claims that
+        # every tick printing the same key gets the same message: the final written for that key
+        # is replayed for this many hours instead of running the agent again (same job prompt,
+        # skills and model pin only). 0 = always run the agent. Keep in sync with
+        # cron.response_reuse.DEFAULT_RESPONSE_REUSE_HOURS.
+        "response_reuse_hours": 24,
     },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per

@@ -2144,10 +2144,11 @@ _RunResult = tuple[bool, str, str, Optional[str]]
 
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
-) -> tuple[Optional[_RunResult], Optional[str]]:
-    """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
-    result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
-    injection block, empty prompt); otherwise ``prompt`` is set."""
+) -> tuple[Optional[_RunResult], Optional[str], Optional[str]]:
+    """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt, reuse_key)``:
+    an early result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
+    injection block, empty prompt, replayed final); otherwise ``prompt`` is set, and ``reuse_key``
+    names the script's reuse claim the caller keeps the final under (None: nothing to keep)."""
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):
@@ -2157,21 +2158,21 @@ def _prepare_job_prompt(
             require_parseable_user_config()
         except InvalidUserConfigError as exc:
             logger.error("Job '%s': refusing to run — %s", job_id, exc)
-            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
+            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None, None
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
-        return _run_no_agent_job(job, job_id, job_name, cancel_event), None
+        return _run_no_agent_job(job, job_id, job_name, cancel_event), None, None
 
     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
     from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
 
     if job_payload_is_empty(job):
-        return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None
+        return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None, None
 
     _early, extra_prompt, monitor_context = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
     if _early is not None:
-        return _early, None
+        return _early, None, None
 
     # Wake-gate: run the pre-check script BEFORE building the prompt; its result is passed into
     # _build_job_prompt so the script runs only once.
@@ -2198,7 +2199,7 @@ def _prepare_job_prompt(
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
-            return (True, silent_doc, SILENT_MARKER, None), None
+            return (True, silent_doc, SILENT_MARKER, None), None, None
 
     try:
         prompt = _build_job_prompt(
@@ -2223,11 +2224,31 @@ def _prepare_job_prompt(
             "and the match is a false positive, rephrase the content to avoid "
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
-        return (False, blocked_doc, "", str(block_exc)), None
+        return (False, blocked_doc, "", str(block_exc)), None, None
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
-        return (True, "", SILENT_MARKER, None), None
-    return None, prompt
+        return (True, "", SILENT_MARKER, None), None, None
+    # The key covers the script's output only: a manual run's extra prompt or a monitor diff is
+    # input it never saw, so those runs neither replay nor keep a final.
+    reuse_key = None
+    if prerun_script is not None and prerun_script[0] and not extra_prompt and not monitor_context:
+        reuse_key = _parse_reuse_key(prerun_script[1])
+    if reuse_key:
+        from cron import response_reuse
+
+        recalled = response_reuse.recall(job, reuse_key)
+        if recalled is not None:
+            written = datetime.fromtimestamp(recalled.written_at, tz=_hermes_now().tzinfo)
+            written_label = written.strftime("%Y-%m-%d %H:%M:%S")
+            logger.info(
+                "Job '%s' (ID: %s): reuseKey matches the final written %s — agent run skipped",
+                job_name, job_id, written_label)
+            reused_doc = (
+                _run_doc_header(job, f"{job_name} (reused final from {written_label})", job_id, prompt)
+                + f"## Response\n\n{recalled.response}\n"
+            )
+            return (True, reused_doc, recalled.response, None), None, None
+    return None, prompt, reuse_key
 
 
 _CRON_DELIVERY_VARS = (
@@ -2462,7 +2483,7 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+    early, prompt, reuse_key = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early
     from run_agent import AIAgent
@@ -2502,8 +2523,13 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
-        if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
-                and _cron_failure_marker_error(final_response) is None):
+        deliverable = (bool(final_response.strip()) and not _is_cron_silence_response(final_response)
+                       and _cron_failure_marker_error(final_response) is None)
+        if reuse_key and deliverable:
+            # Kept before the fallback notice: a replay is not a provider switch.
+            from cron import response_reuse
+            response_reuse.remember(job, reuse_key, final_response)
+        if setup.fallback_notice and deliverable:
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
             # agent-declared failure marker keep their first-line/whole-response contract.
             final_response = f"{setup.fallback_notice}\n\n{final_response}"
@@ -4131,7 +4157,8 @@ from cron.scheduler_script import (  # noqa: E402
     _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
 )
 from cron.scheduler_prompt import (  # noqa: E402
-    _block_and_pause_job, _build_job_prompt, _guard_job_credential_exfil, _parse_wake_gate,
+    _block_and_pause_job, _build_job_prompt, _guard_job_credential_exfil, _parse_reuse_key,
+    _parse_wake_gate,
 )
 from cron.scheduler_preflight import (  # noqa: E402
     BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,
